@@ -1,0 +1,373 @@
+---
+- name: Deploy Noit Application
+  hosts: all
+  become: true
+  gather_facts: true
+  
+  tasks:
+    - name: Ensure docker group exists
+      group:
+        name: docker
+        state: present
+
+    - name: Ensure ubuntu user is in docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Reset ssh connection to allow user ubuntu to use docker without reboot
+      meta: reset_connection
+
+    - name: Resize filesystem after volume expansion
+      command: resize2fs /dev/xvda1
+      ignore_errors: yes
+      
+    - name: Check disk space after resize
+      command: df -h
+      register: disk_space
+      changed_when: false
+      
+    - name: Show disk space information
+      debug:
+        var: disk_space.stdout_lines
+
+    - name: Stop all running Docker containers
+      shell: docker stop $(docker ps -aq) || true
+      tags: [docker]
+      
+    - name: Remove all Docker containers
+      shell: docker rm -f $(docker ps -aq) || true
+      tags: [docker]
+      
+    - name: Prune Docker system (images, volumes, networks)
+      shell: docker system prune -af --volumes
+      tags: [docker]
+      
+    - name: Create Docker temporary build directory in EBS volume
+      file:
+        path: /data/docker_tmp
+        state: directory
+        mode: '0755'
+      tags: [docker]
+      
+    - name: Check disk space after cleanup
+      command: df -h
+      register: disk_space_after
+      tags: [docker]
+      
+    - name: Show disk space after cleanup
+      debug:
+        var: disk_space_after.stdout_lines
+      tags: [docker]
+
+    - name: Instalar git
+      apt:
+        name: git
+        state: present
+        update_cache: yes
+
+    - name: Check if EBS volume is formatted
+      command: blkid /dev/nvme1n1
+      register: blkid_output
+      failed_when: false
+      changed_when: false
+
+    - name: Format EBS volume if not already formatted
+      filesystem:
+        fstype: ext4
+        dev: /dev/nvme1n1
+      when: blkid_output.rc != 0
+
+    - name: Create mount point for Docker data
+      file:
+        path: /data
+        state: directory
+        mode: '0755'
+
+    - name: Mount EBS volume
+      mount:
+        path: /data
+        src: /dev/nvme1n1
+        fstype: ext4
+        state: mounted
+
+    - name: Add mount point to /etc/fstab
+      mount:
+        path: /data
+        src: /dev/nvme1n1
+        fstype: ext4
+        state: present
+
+    - name: Create directory structure for Docker and PostgreSQL
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      with_items:
+        - /data/docker
+        - /data/postgres
+
+    - name: Set ownership and permissions for PostgreSQL directory
+      file:
+        path: /data/postgres
+        owner: 999
+        group: 999
+        mode: '0700'
+        recurse: yes
+        
+    - name: Configure Docker to use EBS volume
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "data-root": "/data/docker"
+          }
+        
+    - name: Restart Docker service
+      systemd:
+        name: docker
+        state: restarted
+        daemon_reload: yes
+      
+    # Asegurar que exista un directorio específico para los datos de PostgreSQL
+    - name: Ensure PostgreSQL data directory exists
+      file:
+        path: /data/postgres/pgdata
+        state: directory
+        owner: 999
+        group: 999
+        mode: '0700'
+        
+    # Asegurar que los permisos sean correctos incluso si el directorio ya existe
+    - name: Ensure PostgreSQL directories have correct permissions
+      shell: |
+        chown -R 999:999 /data/postgres
+        chmod -R 700 /data/postgres
+      
+    - name: Create app directory
+      file:
+        path: /home/ubuntu/noit-app
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+        
+    - name: Copy .env file from local project root
+      copy:
+        src: ../.env
+        dest: /home/ubuntu/noit-app/.env
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Obtener variables del archivo .env
+      command: cat /home/ubuntu/noit-app/.env
+      register: env_file_content
+      changed_when: false
+
+    - name: Configurar variables de entorno
+      set_fact:
+        github_username: "{{ env_file_content.stdout | regex_search('GITHUB_USERNAME=([^\\n]*)', '\\1') | first | default('') }}"
+        github_token: "{{ env_file_content.stdout | regex_search('GITHUB_TOKEN=([^\\n]*)', '\\1') | first | default('') }}"
+      no_log: true
+      
+    # Install Certbot and required packages
+    - name: Install Certbot and dependencies
+      apt:
+        name: 
+          - certbot
+          - python3-certbot-nginx
+          - snapd
+        state: present
+        update_cache: yes
+
+    - name: Ensure snap core is up to date
+      command: snap install core
+      changed_when: false
+
+    - name: Ensure snapd is refreshed
+      command: snap refresh core
+      changed_when: false
+
+    - name: Install Certbot via Snap
+      command: snap install --classic certbot
+      args:
+        creates: /snap/bin/certbot
+      register: certbot_install
+      
+    - name: Check if certbot is a file
+      stat:
+        path: /usr/bin/certbot
+      register: certbot_stat
+      
+    - name: Remove existing certbot file if it exists
+      file:
+        path: /usr/bin/certbot
+        state: absent
+      when: certbot_stat.stat.exists and not certbot_stat.stat.islnk
+      
+    - name: Create certbot symlink
+      file:
+        src: /snap/bin/certbot
+        dest: /usr/bin/certbot
+        state: link
+      when: certbot_install.changed
+
+    - name: Create directories for SSL certificates
+      file:
+        path: "/home/ubuntu/noit-app/{{ item }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      with_items:
+        - certbot/conf
+        - certbot/www
+        - nginx/conf.d
+
+    - name: Generate SSL certificates with Certbot
+      shell: |
+        certbot certonly --standalone \
+          --non-interactive \
+          --agree-tos \
+          --email admin@infinitylabscol.com \
+          --domains noit.com.co,www.noit.com.co \
+          --cert-path /home/ubuntu/noit-app/certbot/conf \
+          --pre-hook "systemctl stop nginx" \
+          --preferred-challenges http
+      args:
+        creates: /etc/letsencrypt/live/noit.com.co/fullchain.pem
+      register: certbot_result
+      
+    - name: Display certbot result
+      debug:
+        var: certbot_result
+        
+    - name: Ensure certificate directory exists
+      file:
+        path: /home/ubuntu/noit-app/certbot/conf
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+        
+    - name: Copy SSL certificates to app directory
+      shell: |
+        rsync -a /etc/letsencrypt/ /home/ubuntu/noit-app/certbot/conf/
+        chown -R ubuntu:ubuntu /home/ubuntu/noit-app/certbot/conf/
+      when: certbot_result.changed
+      
+    - name: Clonar repositorio desde GitHub 
+      become_user: ubuntu
+      git:
+        repo: "https://{{ github_username | urlencode }}:{{ github_token | urlencode }}@github.com/Wiz80/noit_backend.git"
+        dest: /home/ubuntu/noit-app/repo
+        clone: yes
+        update: yes
+        force: yes
+      no_log: true
+
+    - name: Copiar todo el contenido del repositorio al directorio principal
+      become_user: ubuntu
+      shell: cp -R /home/ubuntu/noit-app/repo/* /home/ubuntu/noit-app/ && cp -R /home/ubuntu/noit-app/repo/.* /home/ubuntu/noit-app/ 2>/dev/null || true
+      args:
+        creates: /home/ubuntu/noit-app/docker-compose.yml
+
+    - name: Verificar si existe docker-compose.yml
+      stat:
+        path: /home/ubuntu/noit-app/docker-compose.yml
+      register: docker_compose_stat
+
+    - name: Copiar docker-compose.yml desde el playbook si no existe
+      copy:
+        src: docker-compose.yml
+        dest: /home/ubuntu/noit-app/docker-compose.yml
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+      when: not docker_compose_stat.stat.exists
+
+    - name: Copy postgres-init.sh script
+      copy:
+        src: postgres-init.sh
+        dest: /home/ubuntu/noit-app/postgres-init.sh
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+      tags: [docker]
+
+    - name: Comprobar si existe el Dockerfile
+      stat:
+        path: /home/ubuntu/noit-app/Dockerfile
+      register: dockerfile_stat
+
+    - name: Set permissions on docker socket
+      file:
+        path: /var/run/docker.sock
+        mode: '0666'
+
+    - name: Instalar certificados de docker
+      become: true
+      apt:
+        name: ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Create symbolic link for PostgreSQL data
+      file:
+        src: /data/postgres
+        dest: /home/ubuntu/noit-app/postgres_data
+        state: link
+        owner: ubuntu
+        group: ubuntu
+
+    - name: Start Docker services (build with platform specified)
+      become_user: ubuntu
+      shell: cd /home/ubuntu/noit-app && DOCKER_BUILDKIT=1 TMPDIR=/data/docker_tmp docker-compose build --build-arg TARGETPLATFORM=linux/amd64 --build-arg BUILDPLATFORM=linux/amd64 app
+      register: docker_build_result
+      tags: [docker]
+      
+    - name: Mostrar resultado de docker build
+      debug:
+        var: docker_build_result.stdout_lines
+      tags: [docker]
+
+    - name: Start all Docker services
+      become_user: ubuntu
+      shell: cd /home/ubuntu/noit-app && docker-compose up -d
+      register: docker_compose_result
+      tags: [docker]
+      
+    - name: Mostrar resultado de docker-compose
+      debug:
+        var: docker_compose_result.stdout_lines
+      tags: [docker]
+        
+    - name: Wait for services to start
+      pause:
+        seconds: 30
+      tags: [docker]
+        
+    - name: Check Docker services
+      become_user: ubuntu
+      shell: docker ps
+      register: docker_status
+      tags: [docker]
+      
+    - name: Show Docker services status
+      debug:
+        var: docker_status.stdout_lines
+      tags: [docker]
+      
+    # Aplica migraciones una vez que los servicios estén funcionando
+    - name: Run database migrations
+      become_user: ubuntu
+      shell: cd /home/ubuntu/noit-app && docker-compose exec -T app python -m alembic upgrade head
+      register: migration_result
+      tags: [migrations]
+      
+    - name: Show migration result
+      debug:
+        var: migration_result.stdout_lines
+      tags: [migrations] 
