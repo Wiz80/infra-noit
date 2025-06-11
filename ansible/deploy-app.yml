@@ -333,6 +333,13 @@
         var: docker_build_result.stdout_lines
       tags: [docker]
 
+    - name: Ensure port 80 is free by stopping system Nginx
+      systemd:
+        name: nginx
+        state: stopped
+      ignore_errors: yes # Ignore if nginx is not installed or not running
+      become: true
+
     - name: Start all Docker services
       become_user: ubuntu
       shell: cd /home/ubuntu/noit-app && docker-compose up -d

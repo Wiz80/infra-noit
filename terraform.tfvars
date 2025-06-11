@@ -5,6 +5,6 @@ region = "us-east-1"
 ami_id = "ami-0261755bbcb8c4a84"
 
 # Nombre del par de llaves SSH que ya creaste
-key_name = "noit" 
+key_name = "noit-key" 
 
 ssh_key_path = "keys"

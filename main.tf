@@ -3,6 +3,15 @@ provider "aws" {
   region  = var.region
 }
 
+# S3 bucket for businesses
+resource "aws_s3_bucket" "noit_businesses" {
+  bucket = "noit-businesses"
+  
+  tags = {
+    Name = "noit-businesses"
+  }
+}
+
 # Grupo de seguridad
 resource "aws_security_group" "noit_sg" {
   name        = "noit-sg"
@@ -41,6 +50,22 @@ resource "aws_security_group" "noit_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # Application port 3000
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Application port 8080
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # Salida
   egress {
     from_port   = 0
@@ -64,7 +89,7 @@ resource "aws_default_vpc" "default" {
 # EC2 Instance
 resource "aws_instance" "noit_server" {
   ami                    = var.ami_id
-  instance_type          = "t3a.medium"
+  instance_type          = "t3a.large"
   key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.noit_sg.id]
   
@@ -134,7 +159,7 @@ resource "null_resource" "ansible_provisioner" {
   ]
 
   provisioner "local-exec" {
-    command = "cd ${path.module}/ansible && ansible-playbook -i inventory.ini docker-setup.yml && ansible-playbook -i inventory.ini deploy-app.yml"
+    command = "sleep 30 && cd ${path.module}/ansible && ansible-playbook -i inventory.ini docker-setup.yml && ansible-playbook -i inventory.ini deploy-app.yml"
   }
 
   triggers = {
